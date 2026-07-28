@@ -234,11 +234,7 @@ stateDiagram-v2
     HEALTHY --> DISABLED: 管理员停用
     DISABLED --> HEALTHY: 管理员重新启用
 
-    state DEGRADED
-    note right of DEGRADED
-        数据库已预留该状态，
-        当前版本尚未实现自动进入或恢复逻辑。
-    end note
+    state "DEGRADED（数据库预留，当前无自动迁移）" as DEGRADED
 ```
 
 ## 测试
