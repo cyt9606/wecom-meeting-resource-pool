@@ -26,6 +26,60 @@
 - PostgreSQL 14+
 - Vue 3 / TypeScript / Vite
 
+## 服务架构
+
+```mermaid
+flowchart LR
+    subgraph client["企业微信客户端"]
+        employee["普通员工"]
+        admin["管理员"]
+        spa["Vue 3 单页应用"]
+        employee -->|"申请、查看、修改、取消"| spa
+        admin -->|"资源、管理员、策略配置"| spa
+    end
+
+    subgraph service["会议资源池服务 · FastAPI / Uvicorn"]
+        static["静态文件服务<br/>app/static"]
+        guard["访问控制与安全中间件<br/>企业微信客户端门禁 · Session · 安全响应头"]
+        auth["OAuth 路由<br/>/auth/*"]
+        api["业务 API<br/>/api/v1/*<br/>身份鉴权 · 同源校验 · 限流 · 审计"]
+        scheduler["资源调度器<br/>策略校验 · 幂等 · 远端忙闲检查<br/>资源选择 · 主持人校验 · 失败回滚"]
+        repository["Repository<br/>原子占位 · 状态写入 · 管理配置"]
+        wecom_client["WeComClient<br/>access_token 缓存 · 失效重试 · 错误归一化"]
+        startup["应用启动生命周期<br/>初始化表结构 · 同步初始资源/管理员<br/>释放过期临时占位"]
+
+        static -.->|"提供页面"| spa
+        guard --> auth
+        guard --> api
+        api --> scheduler
+        api --> repository
+        scheduler --> repository
+        scheduler --> wecom_client
+        auth --> wecom_client
+        startup --> repository
+    end
+
+    subgraph data["PostgreSQL"]
+        db[("meeting_resource<br/>reservation<br/>resource_calendar_slot<br/>app_admin · system_policy<br/>operation_log")]
+    end
+
+    subgraph wecom["企业微信开放平台"]
+        oauth_api["OAuth 与成员身份接口"]
+        meeting_api["会议查询、创建、详情<br/>修改、取消接口"]
+        message_api["应用消息接口"]
+    end
+
+    spa -->|"HTTPS / JSON"| guard
+    repository -->|"事务、排斥约束"| db
+    wecom_client --> oauth_api
+    wecom_client --> meeting_api
+    wecom_client --> message_api
+```
+
+核心数据流为：工作台身份进入 → 服务端 OAuth 确认 `userid` → 校验预约策略 →
+逐个检查高级资源的远端会议 → PostgreSQL 原子占位 → 创建会议并校验申请人为主持人 →
+确认占位并返回会议号、密码和入会链接。管理员配置直接存储在数据库中，修改后即时生效。
+
 ## 快速开始
 
 ### 1. 创建数据库
@@ -103,21 +157,89 @@ curl http://127.0.0.1:8001/health
 
 不同企业微信版本和许可下可用接口可能不同，请以企业微信管理后台和官方接口响应为准。
 
-## 运行流程
+## 服务状态转移
 
-```text
-员工进入工作台
-  -> 企业微信 OAuth
-  -> 校验申请时间与策略
-  -> 查询资源账号已有会议
-  -> PostgreSQL 原子占位
-  -> 调用企业微信创建会议
-  -> 校验申请人主持人身份
-  -> 返回完整会议信息
+### 预约状态
+
+```mermaid
+stateDiagram-v2
+    direction LR
+
+    [*] --> HELD: 策略校验通过并原子占位
+    HELD --> CREATING: 开始调用创建会议接口
+    HELD --> FAILED: 启动清理发现两分钟临时占位已过期
+
+    CREATING --> CREATED: 创建成功且主持人校验通过
+    CREATING --> FAILED: 创建接口失败
+    CREATING --> FAILED: 详情或主持人校验失败，尝试取消远端会议
+
+    CREATED --> UPDATING: 修改未开始会议的主题
+    UPDATING --> CREATED: 修改成功
+    UPDATING --> CREATED: 修改失败，记录错误并恢复
+
+    CREATED --> CANCELLING: 取消未开始的会议
+    CANCELLING --> CANCELLED: 远端取消成功或会议已取消
+    CANCELLING --> RECONCILING: 远端取消结果不确定
+
+    FAILED --> [*]
+    CANCELLED --> [*]
+
+    note right of CREATED
+        会议自然结束不会触发本地状态迁移，
+        历史记录仍保留为 CREATED。
+    end note
+
+    note right of RECONCILING
+        保留 ACTIVE 资源占位，防止不确定结果下重复分配。
+        当前版本需人工或后续任务核对。
+    end note
 ```
 
-创建会议失败时，系统会释放本地占位；结果不确定时会进入待核对状态，避免资源被错误
-重复分配。
+`FAILED` 和 `CANCELLED` 是终止状态；`RECONCILING` 表示远端结果不确定，并非取消成功。
+幂等键命中已有预约时直接返回原记录，不创建新的状态实例。
+
+### 资源时段占位状态
+
+```mermaid
+stateDiagram-v2
+    direction LR
+
+    state "HELD" as SLOT_HELD
+    state "ACTIVE" as SLOT_ACTIVE
+    state "RELEASED" as SLOT_RELEASED
+
+    [*] --> SLOT_HELD: 创建预约与临时占位
+    SLOT_HELD --> SLOT_ACTIVE: 预约确认 CREATED
+    SLOT_HELD --> SLOT_RELEASED: 创建失败或临时占位过期
+    SLOT_ACTIVE --> SLOT_RELEASED: 预约确认 CANCELLED
+    SLOT_RELEASED --> [*]
+
+    note right of SLOT_ACTIVE
+        PostgreSQL 排斥约束禁止同一资源的
+        HELD 或 ACTIVE 时段发生重叠。
+    end note
+```
+
+预约与资源占位在同一业务流程中联动：预约 `HELD → CREATING → CREATED` 对应资源占位
+`HELD → ACTIVE`；创建失败对应资源占位 `HELD → RELEASED`；取消结果不确定时预约进入
+`RECONCILING`，资源占位保持 `ACTIVE`。
+
+### 高级资源可用状态
+
+```mermaid
+stateDiagram-v2
+    direction LR
+
+    [*] --> HEALTHY: 新增或启用资源
+    HEALTHY --> DISABLED: 管理员停用
+    DISABLED --> HEALTHY: 管理员重新启用
+
+    state DEGRADED
+    note right of DEGRADED
+        数据库已预留该状态，
+        当前版本尚未实现自动进入或恢复逻辑。
+    end note
+```
 
 ## 测试
 
