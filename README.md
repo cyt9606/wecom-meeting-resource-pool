@@ -64,6 +64,9 @@ Windows PowerShell 激活命令：
 
 生产环境建议把 Secret 放入权限受控的独立环境文件或 Secret Manager，不要提交到 Git。
 
+本仓库只包含会议资源池核心应用，不包含反向代理、TLS 证书、域名认证文件或其他
+特定服务器的基础设施配置。
+
 ### 3. 构建前端
 
 ```bash
@@ -91,7 +94,9 @@ curl http://127.0.0.1:8001/health
 ## 企业微信配置
 
 1. 创建企业微信自建应用并设置应用主页。
-2. 将 `APP_BASE_URL` 对应域名配置为可信域名并完成域名归属认证。
+2. 将 `APP_BASE_URL` 对应域名配置为可信域名；按企业微信后台提示下载认证文件，并由
+   实际托管环境将该文件发布到域名根路径。认证文件可能包含组织专属校验值，不要提交
+   到公开仓库。
 3. 为应用配置可见范围。
 4. 按企业微信后台要求开通通讯录成员读取以及会议创建、查询、修改、取消等接口权限。
 5. 将高级会议许可持有人的 userid 加入资源池。
@@ -126,20 +131,6 @@ pnpm build
 
 生产接口联调脚本位于 `tools/`。运行端到端脚本会真实创建并立即取消一场测试会议，
 请仅在隔离时段和明确授权下使用。
-
-## 部署
-
-仓库提供通用 systemd 示例：
-
-```bash
-sudo cp deploy/wecom-meeting-pool.service.example \
-  /etc/systemd/system/wecom-meeting-pool.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now wecom-meeting-pool
-```
-
-建议使用 Nginx 或其他反向代理提供 HTTPS，并让 Uvicorn 只监听本机地址。域名认证文件
-应由反向代理作为精确静态路径公开，不要把整个静态目录设为匿名可浏览。
 
 ## 安全说明
 
