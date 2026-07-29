@@ -44,6 +44,8 @@ export const api = {
       duration_minutes: number;
       description: string;
       allow_external_user: boolean;
+      password: string | null;
+      enable_waiting_room: boolean;
     },
     idempotencyKey: string
   ) =>
@@ -52,10 +54,21 @@ export const api = {
       headers: { "Idempotency-Key": idempotencyKey },
       body: JSON.stringify(payload)
     }),
-  updateTitle: (id: string, title: string) =>
+  updateReservation: (
+    id: string,
+    payload: {
+      title: string;
+      start_at: string;
+      duration_minutes: number;
+      description: string;
+      allow_external_user: boolean;
+      password: string | null;
+      enable_waiting_room: boolean;
+    }
+  ) =>
     request<Reservation>(`/api/v1/reservations/${id}`, {
       method: "PATCH",
-      body: JSON.stringify({ title })
+      body: JSON.stringify(payload)
     }),
   cancel: (id: string) =>
     request<{ ok: boolean }>(`/api/v1/reservations/${id}/cancel`, {

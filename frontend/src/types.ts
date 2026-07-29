@@ -29,6 +29,8 @@ export interface Reservation {
   host_userid?: string | null;
   resource_display_name?: string | null;
   join_info: JoinInfo;
+  allow_external_user: boolean;
+  enable_waiting_room: boolean;
   last_error?: string | null;
   created_at: string;
   updated_at: string;

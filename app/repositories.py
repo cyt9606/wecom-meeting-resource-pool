@@ -547,6 +547,157 @@ class Repository:
                 raise RuntimeError("reservation not found")
             return dict(row)
 
+    def prepare_update(
+        self,
+        reservation_id: uuid.UUID,
+        *,
+        current_start: datetime,
+        current_end: datetime,
+        next_start: datetime,
+        next_end: datetime,
+        buffer_minutes: int,
+    ) -> None:
+        current_busy = busy_bounds(
+            current_start, current_end, buffer_minutes
+        )
+        next_busy = busy_bounds(next_start, next_end, buffer_minutes)
+        protected_start = min(current_busy[0], next_busy[0])
+        protected_end = max(current_busy[1], next_busy[1])
+        try:
+            with self.database.connection() as connection:
+                slot = connection.execute(
+                    """
+                    UPDATE resource_calendar_slot
+                    SET busy_range = tstzrange(%s, %s, '[)'),
+                        updated_at = now()
+                    WHERE reservation_id = %s AND status = 'ACTIVE'
+                    RETURNING id
+                    """,
+                    (protected_start, protected_end, reservation_id),
+                ).fetchone()
+                if not slot:
+                    raise RuntimeError("active reservation slot not found")
+                connection.execute(
+                    """
+                    UPDATE reservation
+                    SET status = 'UPDATING', updated_at = now(),
+                        last_error_code = NULL, last_error_message = NULL
+                    WHERE id = %s
+                    """,
+                    (reservation_id,),
+                )
+        except errors.ExclusionViolation as error:
+            raise SlotConflict("resource time slot overlaps") from error
+
+    def finish_update(
+        self,
+        reservation_id: uuid.UUID,
+        *,
+        title: str,
+        description: str,
+        start_at: datetime,
+        end_at: datetime,
+        buffer_minutes: int,
+        settings: dict[str, Any],
+        join_info: dict[str, Any],
+    ) -> dict[str, Any]:
+        busy_start, busy_end = busy_bounds(
+            start_at, end_at, buffer_minutes
+        )
+        with self.database.connection() as connection:
+            previous = connection.execute(
+                """
+                SELECT resource_id, start_at, end_at
+                FROM reservation
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (reservation_id,),
+            ).fetchone()
+            if not previous:
+                raise RuntimeError("reservation not found")
+            row = connection.execute(
+                """
+                UPDATE reservation
+                SET title = %s, description = %s,
+                    start_at = %s, end_at = %s,
+                    settings_json = %s::jsonb,
+                    join_info_json = %s::jsonb,
+                    status = 'CREATED', updated_at = now(),
+                    last_error_code = NULL, last_error_message = NULL
+                WHERE id = %s
+                RETURNING *
+                """,
+                (
+                    title,
+                    description,
+                    start_at,
+                    end_at,
+                    json.dumps(settings),
+                    json.dumps(join_info),
+                    reservation_id,
+                ),
+            ).fetchone()
+            connection.execute(
+                """
+                UPDATE resource_calendar_slot
+                SET busy_range = tstzrange(%s, %s, '[)'),
+                    updated_at = now()
+                WHERE reservation_id = %s AND status = 'ACTIVE'
+                """,
+                (busy_start, busy_end, reservation_id),
+            )
+            duration_delta = int(
+                (end_at - start_at).total_seconds()
+                - (previous["end_at"] - previous["start_at"]).total_seconds()
+            )
+            if duration_delta:
+                connection.execute(
+                    """
+                    UPDATE meeting_resource
+                    SET allocated_seconds = GREATEST(
+                            0, allocated_seconds + %s
+                        ),
+                        updated_at = now()
+                    WHERE id = %s
+                    """,
+                    (duration_delta, previous["resource_id"]),
+                )
+            return dict(row)
+
+    def fail_update(
+        self,
+        reservation_id: uuid.UUID,
+        *,
+        start_at: datetime,
+        end_at: datetime,
+        buffer_minutes: int,
+        error_code: str,
+        error_message: str,
+    ) -> None:
+        busy_start, busy_end = busy_bounds(
+            start_at, end_at, buffer_minutes
+        )
+        with self.database.connection() as connection:
+            connection.execute(
+                """
+                UPDATE resource_calendar_slot
+                SET busy_range = tstzrange(%s, %s, '[)'),
+                    updated_at = now()
+                WHERE reservation_id = %s AND status = 'ACTIVE'
+                """,
+                (busy_start, busy_end, reservation_id),
+            )
+            connection.execute(
+                """
+                UPDATE reservation
+                SET status = 'CREATED', last_error_code = %s,
+                    last_error_message = %s, updated_at = now()
+                WHERE id = %s
+                """,
+                (error_code, error_message[:500], reservation_id),
+            )
+
     def set_status(
         self,
         reservation_id: uuid.UUID,

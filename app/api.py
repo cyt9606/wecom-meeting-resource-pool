@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 import uuid
 from collections import defaultdict, deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
 
@@ -11,8 +11,8 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from .auth import CurrentUser, admin_user, current_user
-from .models import ReservationCreate, ReservationUpdate
-from .repositories import DuplicateResource, LastAdmin
+from .models import ReservationCreate, ReservationUpdate, validate_policy
+from .repositories import DuplicateResource, LastAdmin, SlotConflict
 from .scheduler import ResourceUnavailable, Scheduler
 from .wecom import WeComError
 
@@ -79,6 +79,10 @@ def require_same_origin(request: Request) -> None:
 
 
 def public_reservation(row: dict[str, Any]) -> dict[str, Any]:
+    settings = row.get("settings_json") or {}
+    join_info = dict(row.get("join_info_json") or {})
+    if join_info.get("password") is None and settings.get("password"):
+        join_info["password"] = settings["password"]
     return {
         "id": row["id"],
         "status": row["status"],
@@ -89,7 +93,13 @@ def public_reservation(row: dict[str, Any]) -> dict[str, Any]:
         "meetingid": row.get("meetingid"),
         "host_userid": row.get("applicant_userid"),
         "resource_display_name": row.get("resource_display_name"),
-        "join_info": row.get("join_info_json") or {},
+        "join_info": join_info,
+        "allow_external_user": bool(
+            settings.get("allow_external_user", True)
+        ),
+        "enable_waiting_room": bool(
+            settings.get("enable_waiting_room", False)
+        ),
         "last_error": row.get("last_error_message"),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -232,17 +242,135 @@ def build_api_router() -> APIRouter:
             raise HTTPException(status_code=403, detail="无权修改该会议")
         if row["status"] != "CREATED" or row["start_at"] <= datetime.now(timezone.utc):
             raise HTTPException(status_code=409, detail="仅可修改未开始的有效会议")
-        if body.start_at is not None:
-            raise HTTPException(
-                status_code=422,
-                detail="首版暂不支持改期，请取消后重新申请",
+        policy = repo.get_policy()
+        settings = dict(row.get("settings_json") or {})
+        join_info = dict(row.get("join_info_json") or {})
+        next_start = body.start_at or row["start_at"]
+        current_duration = int(
+            (row["end_at"] - row["start_at"]).total_seconds() // 60
+        )
+        next_duration = body.duration_minutes or current_duration
+        next_end = next_start + timedelta(minutes=next_duration)
+        next_title = body.title or row["title"]
+        next_description = (
+            body.description
+            if body.description is not None
+            else row.get("description", "")
+        )
+        next_allow_external = (
+            body.allow_external_user
+            if body.allow_external_user is not None
+            else bool(settings.get("allow_external_user", True))
+        )
+        password_provided = "password" in body.model_fields_set
+        next_password = (
+            body.password
+            if password_provided
+            else settings.get("password") or join_info.get("password")
+        )
+        next_waiting_room = (
+            body.enable_waiting_room
+            if body.enable_waiting_room is not None
+            else bool(settings.get("enable_waiting_room", False))
+        )
+        proposed = ReservationCreate(
+            title=next_title,
+            start_at=next_start,
+            duration_minutes=next_duration,
+            description=next_description,
+            allow_external_user=next_allow_external,
+            password=next_password,
+            enable_waiting_room=next_waiting_room,
+        )
+        time_changed = (
+            proposed.start_at != row["start_at"]
+            or proposed.end_at != row["end_at"]
+        )
+        if time_changed:
+            try:
+                validate_policy(
+                    proposed,
+                    now=datetime.now(timezone.utc),
+                    min_lead_minutes=policy["min_lead_minutes"],
+                    max_duration_minutes=policy["max_duration_minutes"],
+                    max_advance_days=policy["max_advance_days"],
+                )
+            except ValueError as error:
+                raise HTTPException(
+                    status_code=422, detail=str(error)
+                ) from error
+            try:
+                busy = await scheduler(request).remote_busy(
+                    row["resource_userid"],
+                    proposed.start_at,
+                    proposed.end_at,
+                    policy["buffer_minutes"],
+                    exclude_meetingids={row["meetingid"]},
+                )
+            except WeComError as error:
+                raise HTTPException(status_code=502, detail=str(error)) from error
+            if busy:
+                raise HTTPException(
+                    status_code=409,
+                    detail="所选时段的高级会议资源已被占用",
+                )
+        next_settings = {
+            **settings,
+            "allow_external_user": proposed.allow_external_user,
+            "host_userid": row["applicant_userid"],
+            "password": proposed.password,
+            "enable_waiting_room": proposed.enable_waiting_room,
+        }
+        try:
+            repo.prepare_update(
+                reservation_id,
+                current_start=row["start_at"],
+                current_end=row["end_at"],
+                next_start=proposed.start_at,
+                next_end=proposed.end_at,
+                buffer_minutes=policy["buffer_minutes"],
             )
-        repo.set_status(reservation_id, "UPDATING")
+        except SlotConflict as error:
+            raise HTTPException(
+                status_code=409,
+                detail="所选时段的高级会议资源已被占用",
+            ) from error
         try:
             await request.app.state.wecom.update_meeting(
-                row["meetingid"], title=body.title
+                row["meetingid"],
+                title=proposed.title,
+                start_at=proposed.start_at,
+                duration_minutes=proposed.duration_minutes,
+                description=proposed.description,
+                allow_external_user=proposed.allow_external_user,
+                password=proposed.password,
+                set_password=password_provided,
+                enable_waiting_room=proposed.enable_waiting_room,
             )
-            updated = repo.update_title(reservation_id, body.title or row["title"])
+            if password_provided:
+                join_info["password"] = proposed.password
+            try:
+                info = await request.app.state.wecom.get_meeting_info(
+                    row["meetingid"]
+                )
+                join_info = request.app.state.wecom.join_info(info)
+                if (
+                    join_info.get("password") is None
+                    and proposed.password is not None
+                ):
+                    join_info["password"] = proposed.password
+            except WeComError:
+                pass
+            updated = repo.finish_update(
+                reservation_id,
+                title=proposed.title,
+                description=proposed.description,
+                start_at=proposed.start_at,
+                end_at=proposed.end_at,
+                buffer_minutes=policy["buffer_minutes"],
+                settings=next_settings,
+                join_info=join_info,
+            )
             updated["resource_display_name"] = row["resource_display_name"]
             repo.audit(
                 request.state.request_id,
@@ -254,9 +382,11 @@ def build_api_router() -> APIRouter:
             )
             return public_reservation(updated)
         except WeComError as error:
-            repo.set_status(
+            repo.fail_update(
                 reservation_id,
-                "CREATED",
+                start_at=row["start_at"],
+                end_at=row["end_at"],
+                buffer_minutes=policy["buffer_minutes"],
                 error_code=error.code,
                 error_message=error.safe_message,
             )

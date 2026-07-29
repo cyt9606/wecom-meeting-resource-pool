@@ -1,7 +1,12 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from "vue";
 import { api, ApiError } from "./api";
-import { defaultLocalStart, durationText, formatDateTime } from "./date";
+import {
+  defaultLocalStart,
+  durationText,
+  formatDateTime,
+  toLocalInputValue
+} from "./date";
 import { createIdempotencyKey } from "./idempotency";
 import type { Admin, CurrentUser, Policy, Reservation, Resource } from "./types";
 
@@ -20,7 +25,16 @@ const notice = ref("");
 const error = ref("");
 const result = ref<Reservation | null>(null);
 const editingId = ref<string | null>(null);
-const editTitle = ref("");
+const editSaving = ref(false);
+const editDraft = reactive({
+  title: "",
+  startLocal: "",
+  durationMinutes: 60,
+  description: "",
+  allowExternalUser: true,
+  password: "",
+  enableWaitingRoom: false
+});
 const editingResourceId = ref<string | null>(null);
 const newAdminUserid = ref("");
 const newResource = reactive({
@@ -39,7 +53,9 @@ const form = reactive({
   startLocal: defaultLocalStart(),
   durationMinutes: 60,
   description: "",
-  allowExternalUser: true
+  allowExternalUser: true,
+  password: "",
+  enableWaitingRoom: false
 });
 
 const upcoming = computed(() =>
@@ -106,13 +122,17 @@ async function submitReservation() {
         start_at: start.toISOString(),
         duration_minutes: Number(form.durationMinutes),
         description: form.description,
-        allow_external_user: form.allowExternalUser
+        allow_external_user: form.allowExternalUser,
+        password: form.password.trim() || null,
+        enable_waiting_room: form.enableWaitingRoom
       },
       createIdempotencyKey()
     );
     result.value = created;
     form.title = "";
     form.description = "";
+    form.password = "";
+    form.enableWaitingRoom = false;
     await loadReservations();
   } catch (caught) {
     error.value = messageFrom(caught);
@@ -129,17 +149,40 @@ async function copyText(value: string, label: string) {
 
 function beginEdit(item: Reservation) {
   editingId.value = item.id;
-  editTitle.value = item.title;
+  Object.assign(editDraft, {
+    title: item.title,
+    startLocal: toLocalInputValue(item.start_at),
+    durationMinutes: Math.round(
+      (new Date(item.end_at).getTime() - new Date(item.start_at).getTime()) /
+        60_000
+    ),
+    description: item.description,
+    allowExternalUser: item.allow_external_user,
+    password: item.join_info.password || "",
+    enableWaitingRoom: item.enable_waiting_room
+  });
 }
 
-async function saveTitle(item: Reservation) {
+async function saveMeeting(item: Reservation) {
+  error.value = "";
+  editSaving.value = true;
   try {
-    await api.updateTitle(item.id, editTitle.value);
+    await api.updateReservation(item.id, {
+      title: editDraft.title,
+      start_at: new Date(editDraft.startLocal).toISOString(),
+      duration_minutes: Number(editDraft.durationMinutes),
+      description: editDraft.description,
+      allow_external_user: editDraft.allowExternalUser,
+      password: editDraft.password.trim() || null,
+      enable_waiting_room: editDraft.enableWaitingRoom
+    });
     editingId.value = null;
-    notice.value = "会议主题已更新";
+    notice.value = "会议信息已更新";
     await loadReservations();
   } catch (caught) {
     error.value = messageFrom(caught);
+  } finally {
+    editSaving.value = false;
   }
 }
 
@@ -352,12 +395,33 @@ onMounted(bootstrap);
             ></textarea>
           </label>
 
+          <label>
+            <span>入会密码 <i>可选，4—6 位数字</i></span>
+            <input
+              v-model="form.password"
+              inputmode="numeric"
+              pattern="[0-9]{4,6}"
+              minlength="4"
+              maxlength="6"
+              autocomplete="off"
+              placeholder="留空则不设置密码"
+            />
+          </label>
+
           <label class="switch-row">
             <span>
               <b>允许企业外人员入会</b>
               <small>关闭后仅本企业成员可加入</small>
             </span>
             <input v-model="form.allowExternalUser" type="checkbox" />
+          </label>
+
+          <label class="switch-row">
+            <span>
+              <b>开启等候室</b>
+              <small>新成员需主持人准入后才能进入会议</small>
+            </span>
+            <input v-model="form.enableWaitingRoom" type="checkbox" />
           </label>
 
           <button class="primary-button submit-button" :disabled="submitting">
@@ -457,22 +521,105 @@ onMounted(bootstrap);
             <div class="meeting-main">
               <div>
                 <span class="status-chip" :data-status="item.status">{{ item.status }}</span>
-                <h3 v-if="editingId !== item.id">{{ item.title }}</h3>
-                <input v-else v-model="editTitle" maxlength="20" class="inline-edit" />
+                <h3>{{ item.title }}</h3>
               </div>
               <p>{{ formatDateTime(item.start_at) }} · {{ durationText(item.start_at, item.end_at) }}</p>
               <small>{{ item.resource_display_name }}</small>
             </div>
-            <div v-if="item.status === 'CREATED'" class="row-actions">
-              <template v-if="editingId === item.id">
-                <button @click="saveTitle(item)">保存</button>
-                <button @click="editingId = null">放弃</button>
-              </template>
-              <template v-else>
-                <button @click="beginEdit(item)">改主题</button>
-                <button class="danger" @click="cancelMeeting(item)">取消</button>
-              </template>
+            <div
+              v-if="
+                item.status === 'CREATED' &&
+                editingId !== item.id &&
+                new Date(item.start_at).getTime() > Date.now()
+              "
+              class="row-actions"
+            >
+              <button @click="beginEdit(item)">编辑</button>
+              <button class="danger" @click="cancelMeeting(item)">取消</button>
             </div>
+            <form
+              v-if="editingId === item.id"
+              class="meeting-edit-form"
+              @submit.prevent="saveMeeting(item)"
+            >
+              <div class="edit-form-heading">
+                <div>
+                  <p class="sequence">编辑会议</p>
+                  <h4>修改后将同步到企业微信会议</h4>
+                </div>
+                <button type="button" class="text-button" @click="editingId = null">
+                  放弃
+                </button>
+              </div>
+              <label>
+                <span>会议主题</span>
+                <input v-model="editDraft.title" maxlength="20" required />
+              </label>
+              <div class="field-row">
+                <label>
+                  <span>开始时间</span>
+                  <input
+                    v-model="editDraft.startLocal"
+                    type="datetime-local"
+                    required
+                  />
+                </label>
+                <label>
+                  <span>预计时长</span>
+                  <select v-model.number="editDraft.durationMinutes">
+                    <option :value="30">30 分钟</option>
+                    <option :value="60">1 小时</option>
+                    <option :value="90">1.5 小时</option>
+                    <option :value="120">2 小时</option>
+                    <option :value="180">3 小时</option>
+                    <option :value="240">4 小时</option>
+                    <option :value="300">5 小时</option>
+                    <option :value="360">6 小时</option>
+                    <option :value="420">7 小时</option>
+                    <option :value="480">8 小时</option>
+                  </select>
+                </label>
+              </div>
+              <label>
+                <span>会议说明 <i>可选</i></span>
+                <textarea
+                  v-model="editDraft.description"
+                  maxlength="500"
+                  rows="3"
+                ></textarea>
+              </label>
+              <label>
+                <span>入会密码 <i>可选，4—6 位数字；留空取消密码</i></span>
+                <input
+                  v-model="editDraft.password"
+                  inputmode="numeric"
+                  pattern="[0-9]{4,6}"
+                  minlength="4"
+                  maxlength="6"
+                  autocomplete="off"
+                  placeholder="留空则不设置密码"
+                />
+              </label>
+              <div class="edit-switches">
+                <label class="switch-row">
+                  <span>
+                    <b>允许企业外人员入会</b>
+                    <small>关闭后仅本企业成员可加入</small>
+                  </span>
+                  <input v-model="editDraft.allowExternalUser" type="checkbox" />
+                </label>
+                <label class="switch-row">
+                  <span>
+                    <b>开启等候室</b>
+                    <small>由主持人逐一准入参会成员</small>
+                  </span>
+                  <input v-model="editDraft.enableWaitingRoom" type="checkbox" />
+                </label>
+              </div>
+              <button class="primary-button edit-save-button" :disabled="editSaving">
+                {{ editSaving ? "正在同步…" : "保存全部修改" }}
+              </button>
+            </form>
           </article>
         </div>
         <p v-else class="empty-state">还没有会议申请。<button @click="tab = 'apply'">创建第一场</button></p>

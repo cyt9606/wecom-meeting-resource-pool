@@ -45,6 +45,8 @@ class Scheduler:
         start_at: datetime,
         end_at: datetime,
         buffer_minutes: int,
+        *,
+        exclude_meetingids: set[str] | None = None,
     ) -> bool:
         buffer = timedelta(minutes=buffer_minutes)
         meetingids = await self.wecom.get_user_meeting_ids(
@@ -53,6 +55,8 @@ class Scheduler:
             end_at + buffer,
         )
         for meetingid in meetingids:
+            if meetingid in (exclude_meetingids or set()):
+                continue
             try:
                 info = await self.wecom.get_meeting_info(meetingid)
             except WeComError:
@@ -164,6 +168,8 @@ class Scheduler:
                     settings={
                         "allow_external_user": request.allow_external_user,
                         "host_userid": applicant_userid,
+                        "password": request.password,
+                        "enable_waiting_room": request.enable_waiting_room,
                     },
                 )
             except SlotConflict:
@@ -181,6 +187,8 @@ class Scheduler:
                     duration_minutes=request.duration_minutes,
                     description=request.description,
                     allow_external_user=request.allow_external_user,
+                    password=request.password,
+                    enable_waiting_room=request.enable_waiting_room,
                 )
             except WeComError as error:
                 last_error = error

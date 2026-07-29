@@ -17,6 +17,12 @@ export function defaultLocalStart(): string {
   return local.toISOString().slice(0, 16);
 }
 
+export function toLocalInputValue(value: string): string {
+  const date = new Date(value);
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 16);
+}
+
 export function durationText(start: string, end: string): string {
   const minutes = Math.round(
     (new Date(end).getTime() - new Date(start).getTime()) / 60_000

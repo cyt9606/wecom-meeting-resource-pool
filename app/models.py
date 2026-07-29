@@ -23,6 +23,11 @@ class ReservationCreate(BaseModel):
     duration_minutes: int = Field(ge=5, le=480)
     description: str = Field(default="", max_length=500)
     allow_external_user: bool = True
+    password: str | None = Field(
+        default=None,
+        pattern=r"^[0-9]{4,6}$",
+    )
+    enable_waiting_room: bool = False
 
     @field_validator("title")
     @classmethod
@@ -41,6 +46,14 @@ class ReservationCreate(BaseModel):
             raise ValueError("start_at 必须包含时区")
         return value.astimezone(timezone.utc)
 
+    @field_validator("password", mode="before")
+    @classmethod
+    def clean_password(cls, value: object) -> object:
+        if isinstance(value, str):
+            value = value.strip()
+            return value or None
+        return value
+
     @property
     def end_at(self) -> datetime:
         return self.start_at + timedelta(minutes=self.duration_minutes)
@@ -50,6 +63,10 @@ class ReservationUpdate(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=20)
     start_at: datetime | None = None
     duration_minutes: int | None = Field(default=None, ge=5, le=480)
+    description: str | None = Field(default=None, max_length=500)
+    allow_external_user: bool | None = None
+    password: str | None = Field(default=None, pattern=r"^[0-9]{4,6}$")
+    enable_waiting_room: bool | None = None
 
     @field_validator("title")
     @classmethod
@@ -72,11 +89,19 @@ class ReservationUpdate(BaseModel):
             raise ValueError("start_at 必须包含时区")
         return value.astimezone(timezone.utc)
 
+    @field_validator("password", mode="before")
+    @classmethod
+    def clean_password(cls, value: object) -> object:
+        if isinstance(value, str):
+            value = value.strip()
+            return value or None
+        return value
+
     @model_validator(mode="after")
     def time_fields_together(self) -> "ReservationUpdate":
         if (self.start_at is None) != (self.duration_minutes is None):
             raise ValueError("修改时间时必须同时提交 start_at 和 duration_minutes")
-        if self.title is None and self.start_at is None:
+        if not self.model_fields_set:
             raise ValueError("没有可修改的字段")
         return self
 

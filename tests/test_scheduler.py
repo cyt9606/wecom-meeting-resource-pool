@@ -107,6 +107,10 @@ async def test_create_assigns_applicant_as_host_and_confirms():
         == "resource-owner"
     )
     assert wecom.create_meeting.await_args.kwargs["host_userid"] == "requester"
+    assert wecom.create_meeting.await_args.kwargs["password"] is None
+    assert (
+        wecom.create_meeting.await_args.kwargs["enable_waiting_room"] is False
+    )
     wecom.update_meeting.assert_not_awaited()
 
 

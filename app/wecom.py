@@ -159,8 +159,20 @@ class WeComClient:
         duration_minutes: int,
         description: str,
         allow_external_user: bool,
+        password: str | None,
+        enable_waiting_room: bool,
     ) -> str:
         attendees = list(dict.fromkeys([admin_userid, host_userid]))
+        settings: dict[str, Any] = {
+            "remind_scope": 2,
+            "enable_waiting_room": enable_waiting_room,
+            "allow_enter_before_host": True,
+            "enable_enter_mute": 1,
+            "allow_external_user": allow_external_user,
+            "hosts": {"userid": [host_userid]},
+        }
+        if password:
+            settings["password"] = password
         result = await self.api(
             "POST",
             "/cgi-bin/meeting/create",
@@ -172,14 +184,7 @@ class WeComClient:
                 "meeting_duration": duration_minutes * 60,
                 "description": description,
                 "attendees": {"userid": attendees},
-                "settings": {
-                    "remind_scope": 2,
-                    "enable_waiting_room": False,
-                    "allow_enter_before_host": True,
-                    "enable_enter_mute": 1,
-                    "allow_external_user": allow_external_user,
-                    "hosts": {"userid": [host_userid]},
-                },
+                "settings": settings,
                 "reminders": {"is_repeat": 0, "remind_before": [900]},
             },
         )
@@ -203,6 +208,11 @@ class WeComClient:
         title: str | None = None,
         start_at: datetime | None = None,
         duration_minutes: int | None = None,
+        description: str | None = None,
+        allow_external_user: bool | None = None,
+        password: str | None = None,
+        set_password: bool = False,
+        enable_waiting_room: bool | None = None,
         host_userid: str | None = None,
         admin_userid: str | None = None,
     ) -> None:
@@ -212,12 +222,24 @@ class WeComClient:
         if start_at is not None and duration_minutes is not None:
             payload["meeting_start"] = int(start_at.timestamp())
             payload["meeting_duration"] = duration_minutes * 60
+        if description is not None:
+            payload["description"] = description
+        settings: dict[str, Any] = {}
+        if allow_external_user is not None:
+            settings["allow_external_user"] = allow_external_user
+        if set_password:
+            # The meeting API uses an empty value to remove an existing password.
+            settings["password"] = password or ""
+        if enable_waiting_room is not None:
+            settings["enable_waiting_room"] = enable_waiting_room
         if host_userid:
             attendees = [host_userid]
             if admin_userid:
                 attendees.insert(0, admin_userid)
             payload["attendees"] = {"userid": list(dict.fromkeys(attendees))}
-            payload["settings"] = {"hosts": {"userid": [host_userid]}}
+            settings["hosts"] = {"userid": [host_userid]}
+        if settings:
+            payload["settings"] = settings
         await self.api(
             "POST",
             "/cgi-bin/meeting/update",

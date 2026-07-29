@@ -1,5 +1,6 @@
 import httpx
 import pytest
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 from app.wecom import WeComClient, WeComError
@@ -48,4 +49,60 @@ async def test_cancel_is_idempotent_when_meeting_is_already_cancelled():
     )
 
     await client.cancel_meeting("meeting-1")
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_create_meeting_sends_password_and_waiting_room():
+    client = WeComClient("corp", "secret")
+    client.api = AsyncMock(return_value={"errcode": 0, "meetingid": "meeting-1"})
+
+    meetingid = await client.create_meeting(
+        admin_userid="advanced",
+        host_userid="requester",
+        title="安全会议",
+        start_at=datetime.now(timezone.utc),
+        duration_minutes=60,
+        description="说明",
+        allow_external_user=False,
+        password="2468",
+        enable_waiting_room=True,
+    )
+
+    assert meetingid == "meeting-1"
+    payload = client.api.await_args.kwargs["payload"]
+    assert payload["settings"]["password"] == "2468"
+    assert payload["settings"]["enable_waiting_room"] is True
+    assert payload["settings"]["allow_external_user"] is False
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_update_meeting_sends_all_editable_fields_and_clears_password():
+    client = WeComClient("corp", "secret")
+    client.api = AsyncMock(return_value={"errcode": 0})
+    start_at = datetime.now(timezone.utc)
+
+    await client.update_meeting(
+        "meeting-1",
+        title="新主题",
+        start_at=start_at,
+        duration_minutes=90,
+        description="新说明",
+        allow_external_user=True,
+        password=None,
+        set_password=True,
+        enable_waiting_room=True,
+    )
+
+    payload = client.api.await_args.kwargs["payload"]
+    assert payload["title"] == "新主题"
+    assert payload["meeting_start"] == int(start_at.timestamp())
+    assert payload["meeting_duration"] == 90 * 60
+    assert payload["description"] == "新说明"
+    assert payload["settings"] == {
+        "allow_external_user": True,
+        "password": "",
+        "enable_waiting_room": True,
+    }
     await client.close()

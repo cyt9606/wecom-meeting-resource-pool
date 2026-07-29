@@ -20,6 +20,11 @@ def test_public_reservation_does_not_expose_resource_userid():
             "resource_display_name": "高级会议资源 01",
             "resource_userid": "resource-owner",
             "join_info_json": {},
+            "settings_json": {
+                "allow_external_user": False,
+                "enable_waiting_room": True,
+                "password": "2468",
+            },
             "created_at": now,
             "updated_at": now,
         }
@@ -27,6 +32,9 @@ def test_public_reservation_does_not_expose_resource_userid():
     assert "resource_userid" not in result
     assert result["resource_display_name"] == "高级会议资源 01"
     assert result["host_userid"] == "requester"
+    assert result["allow_external_user"] is False
+    assert result["enable_waiting_room"] is True
+    assert result["join_info"]["password"] == "2468"
 
 
 def test_resource_unavailable_recommendations_are_json_serializable():
